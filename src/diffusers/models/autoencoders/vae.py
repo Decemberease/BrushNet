@@ -17,6 +17,8 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+#hyper模块导入
+
 
 from ...utils import BaseOutput, is_torch_version
 from ...utils.torch_utils import randn_tensor
@@ -28,6 +30,79 @@ from ..unets.unet_2d_blocks import (
     get_down_block,
     get_up_block,
 )
+
+
+#hyper
+class MessageAgg(nn.Module):
+    def __init__(self, agg_method="mean"):
+        super().__init__()
+        #hyper
+       
+        self.agg_method = agg_method
+
+    def forward(self, X, path):
+        path = path.to(X.dtype)
+        X = torch.matmul(path, X)
+        if self.agg_method == "mean":
+            norm_out = 1 / torch.sum(path, dim=2, keepdim=True)
+            norm_out[torch.isinf(norm_out)] = 0
+            X = norm_out * X
+        return X
+
+class HyPConv(nn.Module):
+    def __init__(self, c1, c2):
+        super().__init__()
+        self.fc = nn.Linear(c1, c2)
+        self.v2e = MessageAgg(agg_method="mean")
+        self.e2v = MessageAgg(agg_method="mean")
+
+    def forward(self, x, H):
+        x = self.fc(x)
+        E = self.v2e(x, H.transpose(1, 2).contiguous())
+        x = self.e2v(E, H)
+        return x
+        
+class HyperComputeModule(nn.Module):
+    def __init__(self, c1, c2, threshold, hidden_size):
+        super().__init__()
+        self.threshold = threshold
+        self.hgconv = HyPConv(c1, c2)
+        self.norm = nn.GroupNorm(num_groups=1, num_channels=hidden_size)  # 使用GroupNorm
+        self.act = nn.SiLU()
+
+    def forward(self, x):
+        b, c, d = x.shape
+        x = x.transpose(1, 2).contiguous()  # [B, D, C]
+        feature = x.clone()
+        distance = torch.cdist(feature, feature)
+        hg = distance < self.threshold
+        hg = hg.float().to(x.device)
+        x = self.hgconv(x, hg) + x
+        x = x.transpose(1, 2).contiguous()  # [B, C, D]
+        x = self.act(self.norm(x))
+        return x
+
+# class HyperComputeModule(nn.Module):
+#     def __init__(self, c1, c2, threshold, hidden_size):
+#         super().__init__()
+#         self.threshold = threshold
+#         self.hgconv = HyPConv(c1, c2)
+#         self.norm = nn.LayerNorm(hidden_size)
+#         self.act = nn.SiLU()
+
+#     # def forward(self, x):
+#     #     b, c, d = x.shape[0], x.shape[1], x.shape[2]
+#     #     x = x.transpose(1, 2).contiguous()  # [B, D, C]
+#     #     feature = x.clone()
+#     #     distance = torch.cdist(feature, feature)
+#     #     hg = distance < self.threshold
+#     #     hg = hg.float().to(x.device)
+#     #     x = self.hgconv(x, hg) + x
+#     #     x = x.transpose(1, 2).contiguous()  # 恢复为 [B, C, D]
+#     #     x = self.act(self.norm(x))
+#     #     return x
+    
+
 
 
 @dataclass
@@ -127,7 +202,13 @@ class Encoder(nn.Module):
             temb_channels=None,
             add_attention=mid_block_add_attention,
         )
-
+        #hyper
+        self.hyper_comp = HyperComputeModule(
+            c1=block_out_channels[-1], 
+            c2=block_out_channels[-1],
+            threshold=9,
+            hidden_size=block_out_channels[-1]
+        )
         # out
         self.conv_norm_out = nn.GroupNorm(num_channels=block_out_channels[-1], num_groups=norm_num_groups, eps=1e-6)
         self.conv_act = nn.SiLU()
@@ -173,6 +254,11 @@ class Encoder(nn.Module):
 
             # middle
             sample = self.mid_block(sample)
+            #hyper
+            B, C, H, W = sample.shape
+            hyper_feat = sample.view(B, C, H*W)
+            hyper_out = self.hyper_comp(hyper_feat)
+            sample = hyper_out.view(B, C, H, W)
 
         # post-process
         sample = self.conv_norm_out(sample)
@@ -245,7 +331,12 @@ class Decoder(nn.Module):
             temb_channels=temb_channels,
             add_attention=mid_block_add_attention,
         )
-
+        self.hyper_comp = HyperComputeModule(
+            c1=block_out_channels[-1],
+            c2=block_out_channels[-1],
+            threshold=9,
+            hidden_size=block_out_channels[-1]
+        )
         # up
         reversed_block_out_channels = list(reversed(block_out_channels))
         output_channel = reversed_block_out_channels[0]
@@ -309,7 +400,12 @@ class Decoder(nn.Module):
                     use_reentrant=False,
                 )
                 sample = sample.to(upscale_dtype)
-
+                #hyper
+                B, C, H, W = sample.shape
+                hyper_feat = sample.view(B, C, H*W)
+                hyper_out = self.hyper_comp(hyper_feat)
+                sample = hyper_out.view(B, C, H, W)
+                
                 # up
                 for up_block in self.up_blocks:
                     sample = torch.utils.checkpoint.checkpoint(
